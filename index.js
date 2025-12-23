@@ -1,22 +1,16 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, Events, EmbedBuilder, MessageFlags } = require("discord.js");
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const logger = require("./logger");
+
+// ✅ IMPORTANT: updated import (see shopify.js patch at bottom)
+const { getPaidLineItemsByEmail } = require("./shopify");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
-app.get("/", (req, res) => {
-  res.send("XPLX Access Bot is running ✅");
-});
-
-app.listen(PORT, () => {
-  console.log(`🌐 Web server listening on port ${PORT}`);
-});
-
-const { getPaidLineItemsByEmail } = require("./shopify");
-const logger = require("./logger");
-const fs = require("fs");
-const path = require("path");
 
 /* =======================
    CONFIG
@@ -26,18 +20,40 @@ const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "";
 const MASK_EMAILS = process.env.MASK_EMAILS === "true";
 const LOG_DEBUG = process.env.LOG_DEBUG === "true";
 
+// ✅ Audit config (Subscription-only enforcement)
+const AUDIT_ENABLED = (process.env.AUDIT_ENABLED ?? "true") === "true";
+const AUDIT_DRY_RUN = (process.env.AUDIT_DRY_RUN ?? "false") === "true"; // set true first if you want "logs only"
+const AUDIT_INTERVAL_HOURS = Number(process.env.AUDIT_INTERVAL_HOURS ?? "24"); // daily by default
+const AUDIT_GRACE_DAYS = Number(process.env.AUDIT_GRACE_DAYS ?? "35"); // your Day-35 rule
+
+/* =======================
+   EXPRESS (Render health)
+======================= */
+app.get("/", (req, res) => {
+  res.send("XPLX Access Bot is running ✅");
+});
+
+app.listen(PORT, () => {
+  console.log(`🌐 Web server listening on port ${PORT}`);
+});
+
 /* =======================
    EMAIL ↔ DISCORD STORAGE
+   (Render + GitHub friendly)
 ======================= */
-const DATA_DIR = path.join(__dirname, "data");
-const EMAIL_MAP_PATH = path.join(DATA_DIR, "email-map.json");
+// ✅ Recommended on Render with Persistent Disk:
+// set EMAIL_MAP_PATH=/var/data/email-map.json
+// and mount disk at /var/data
+const DEFAULT_EMAIL_MAP_PATH = path.join(__dirname, "data", "email-map.json");
+const EMAIL_MAP_PATH = process.env.EMAIL_MAP_PATH || DEFAULT_EMAIL_MAP_PATH;
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+function ensureDirForFile(filePath) {
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 function loadEmailMap() {
-  ensureDataDir();
+  ensureDirForFile(EMAIL_MAP_PATH);
   if (!fs.existsSync(EMAIL_MAP_PATH)) return {};
   try {
     return JSON.parse(fs.readFileSync(EMAIL_MAP_PATH, "utf8"));
@@ -47,12 +63,16 @@ function loadEmailMap() {
 }
 
 function saveEmailMap(map) {
-  ensureDataDir();
+  ensureDirForFile(EMAIL_MAP_PATH);
   fs.writeFileSync(EMAIL_MAP_PATH, JSON.stringify(map, null, 2));
 }
 
 function normEmail(email) {
   return (email || "").trim().toLowerCase();
+}
+
+function daysBetween(now, past) {
+  return Math.floor((now.getTime() - past.getTime()) / (1000 * 60 * 60 * 24));
 }
 
 /* =======================
@@ -79,6 +99,10 @@ function pickHighestTier(titles) {
     if (normTitles.some((x) => x.includes(normalize(t.product)))) return t;
   }
   return null;
+}
+
+function isTierTitleMatch(lineItemTitle, tierProductName) {
+  return normalize(lineItemTitle).includes(normalize(tierProductName));
 }
 
 /* =======================
@@ -129,6 +153,24 @@ async function setExclusiveTierRole(member, guild, roleName) {
   if (toRemove.length) await member.roles.remove(toRemove);
 }
 
+// ✅ Used by audit to remove access
+async function downgradeToMembers(member, guild) {
+  const rolesByName = new Map(guild.roles.cache.map((r) => [r.name, r]));
+  const base = rolesByName.get(BASE_ROLE_NAME);
+  if (!base) throw new Error(`Base role not found: ${BASE_ROLE_NAME}`);
+
+  // keep Members
+  await member.roles.add(base);
+
+  // remove all paid tiers except Members
+  const toRemove = ALL_ROLE_NAMES
+    .filter((n) => n !== BASE_ROLE_NAME)
+    .map((n) => rolesByName.get(n))
+    .filter(Boolean);
+
+  if (toRemove.length) await member.roles.remove(toRemove);
+}
+
 /* =======================
    LOGS (CLEAN EMBEDS)
 ======================= */
@@ -156,10 +198,14 @@ function levelColor(level) {
 }
 
 function prettyItems(items = []) {
-  return items.slice(0, 3).map((i) => {
-    const sub = i.isSubscription ? `✅ Sub (${i.sellingPlanName || "plan"})` : "💳 One-time";
-    return `• ${i.title} — ${sub}`;
-  }).join("\n");
+  return items
+    .slice(0, 3)
+    .map((i) => {
+      const sub = i.isSubscription ? `✅ Sub (${i.sellingPlanName || "plan"})` : "💳 One-time";
+      const paidAt = i.paidAt ? ` • 🕒 ${i.paidAt}` : "";
+      return `• ${i.title} — ${sub}${paidAt}`;
+    })
+    .join("\n");
 }
 
 async function postBotLog(client, event, payload = {}, level = "INFO") {
@@ -186,6 +232,9 @@ async function postBotLog(client, event, payload = {}, level = "INFO") {
     fields.push({ name: "Subscription", value: safePayload.subscription ? "✅ Yes" : "❌ No", inline: true });
   }
   if (typeof safePayload.count === "number") fields.push({ name: "Count", value: `\`${safePayload.count}\``, inline: true });
+  if (safePayload.daysSincePaid != null) fields.push({ name: "Days Since Paid", value: `\`${safePayload.daysSincePaid}\``, inline: true });
+  if (safePayload.lastPaidAt) fields.push({ name: "Last Paid", value: `\`${safePayload.lastPaidAt}\``, inline: true });
+  if (safePayload.dryRun != null) fields.push({ name: "Dry Run", value: safePayload.dryRun ? "✅ Yes" : "❌ No", inline: true });
 
   let summary = "";
   if (Array.isArray(safePayload.items) && safePayload.items.length) {
@@ -232,9 +281,145 @@ const client = new Client({
   ],
 });
 
+/* =======================
+   SUBSCRIPTION AUDIT LOOP
+   (Day 35 enforcement)
+======================= */
+function startSubscriptionAuditLoop() {
+  if (!AUDIT_ENABLED) {
+    logger.info({ event: "audit_disabled" });
+    return;
+  }
+
+  const run = () => runSubscriptionAudit().catch((err) => {
+    logger.error({ event: "audit_loop_error", err: String(err) });
+  });
+
+  // Run 60 seconds after startup, then repeat
+  setTimeout(run, 60_000);
+  setInterval(run, AUDIT_INTERVAL_HOURS * 60 * 60 * 1000);
+
+  logger.info({
+    event: "audit_loop_started",
+    intervalHours: AUDIT_INTERVAL_HOURS,
+    graceDays: AUDIT_GRACE_DAYS,
+    dryRun: AUDIT_DRY_RUN,
+  });
+}
+
+async function runSubscriptionAudit() {
+  const map = loadEmailMap();
+  const now = new Date();
+
+  await postBotLog(client, "audit_start", {
+    message: `Audit started • grace=${AUDIT_GRACE_DAYS}d • interval=${AUDIT_INTERVAL_HOURS}h • dryRun=${AUDIT_DRY_RUN}`,
+  }, "INFO");
+
+  for (const [email, rec] of Object.entries(map)) {
+    try {
+      // ✅ subscription-only gate
+      if (!rec || rec.isSubscription !== true) continue;
+      if (!rec.discordUserId) continue;
+
+      // If lastPaidAt is missing, skip (don’t accidentally remove anyone)
+      if (!rec.lastPaidAt) {
+        await postBotLog(client, "audit_skip_missing_lastPaidAt", {
+          email,
+          userId: rec.discordUserId,
+          userTag: rec.userTag,
+          message: "Record missing lastPaidAt; skipping for safety.",
+        }, "WARN");
+        continue;
+      }
+
+      const lastPaidDate = new Date(rec.lastPaidAt);
+      if (Number.isNaN(lastPaidDate.getTime())) {
+        await postBotLog(client, "audit_skip_invalid_lastPaidAt", {
+          email,
+          userId: rec.discordUserId,
+          userTag: rec.userTag,
+          lastPaidAt: rec.lastPaidAt,
+          message: "Invalid lastPaidAt format; skipping for safety.",
+        }, "WARN");
+        continue;
+      }
+
+      const daysSincePaid = daysBetween(now, lastPaidDate);
+
+      if (daysSincePaid < AUDIT_GRACE_DAYS) {
+        // optional: log only when close to expiry (reduce noise)
+        continue;
+      }
+
+      // Fetch member live
+      const guild = client.guilds.cache.first();
+      if (!guild) continue;
+
+      const member = await guild.members.fetch(rec.discordUserId).catch(() => null);
+      if (!member) {
+        await postBotLog(client, "audit_member_not_found", {
+          email,
+          userId: rec.discordUserId,
+          userTag: rec.userTag,
+          daysSincePaid,
+          lastPaidAt: rec.lastPaidAt,
+        }, "WARN");
+        continue;
+      }
+
+      await postBotLog(client, "audit_overdue_detected", {
+        email,
+        userId: rec.discordUserId,
+        userTag: rec.userTag,
+        daysSincePaid,
+        lastPaidAt: rec.lastPaidAt,
+        dryRun: AUDIT_DRY_RUN,
+      }, "WARN");
+
+      if (AUDIT_DRY_RUN) continue;
+
+      await downgradeToMembers(member, guild);
+
+      // Update record so you can see audit actions
+      map[email] = {
+        ...rec,
+        tier: BASE_ROLE_NAME,
+        lastAuditAt: new Date().toISOString(),
+        lastAuditReason: `overdue_${daysSincePaid}d`,
+        updatedAt: new Date().toISOString(),
+      };
+      saveEmailMap(map);
+
+      await postBotLog(client, "audit_downgrade_success", {
+        email,
+        userId: rec.discordUserId,
+        userTag: rec.userTag,
+        daysSincePaid,
+        lastPaidAt: rec.lastPaidAt,
+        grantedRole: BASE_ROLE_NAME,
+      }, "SUCCESS");
+
+    } catch (err) {
+      await postBotLog(client, "audit_error", {
+        email,
+        userId: rec?.discordUserId,
+        userTag: rec?.userTag,
+        error: err?.message || String(err),
+      }, "ERROR");
+    }
+  }
+
+  await postBotLog(client, "audit_end", {
+    message: "Audit finished ✅",
+  }, "INFO");
+}
+
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Logged in as ${c.user.tag}`);
   await postBotLog(client, "bot_online", { userTag: c.user.tag, userId: c.user.id }, "INFO");
+
+  // ✅ Start audit loop after bot is online
+  startSubscriptionAuditLoop();
 });
 
 /* =======================
@@ -298,6 +483,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         bullet(`Discord User ID: \`${entry.discordUserId}\``),
         bullet(`User Tag: **${entry.userTag || "unknown"}**`),
         bullet(`Tier: ${fmtRole(entry.tier || "unknown")}`),
+        bullet(`Subscription: ${entry.isSubscription ? "✅ yes" : "❌ no"}`),
+        bullet(`Last Paid: \`${entry.lastPaidAt || "unknown"}\``),
         bullet(`Updated: \`${entry.updatedAt || "unknown"}\``),
       ]),
       flags: MessageFlags.Ephemeral,
@@ -309,7 +496,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
   ===================== */
   if (cmd === "status") {
     const statusEmail = normEmail(interaction.options.getString("email"));
-
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
@@ -421,8 +607,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   });
 
   try {
+    // ✅ IMPORTANT: shopify helper now returns items that MAY include paidAt on each item (see patch below)
     const items = await getPaidLineItemsByEmail(email);
+
     const titles = items.map((i) => i.title);
+
+    const tier = pickHighestTier(titles);
 
     await postBotLog(client, "shopify_line_items", {
       email,
@@ -449,8 +639,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
-    const tier = pickHighestTier(titles);
-
     await postBotLog(client, "tier_matched", {
       email,
       userTag: interaction.user.tag,
@@ -475,13 +663,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
+    // ✅ Determine subscription ONLY for the matched tier line item
+    const matchedIsSubscription = items.some((li) =>
+      isTierTitleMatch(li.title, tier.product) && li.isSubscription === true
+    );
+
+    // ✅ lastPaidAt: take newest paidAt we can find (requires shopify.js patch)
+    const paidDates = items.map((x) => x.paidAt).filter(Boolean).map((d) => new Date(d));
+    const newestPaid = paidDates.length ? new Date(Math.max(...paidDates.map((d) => d.getTime()))) : null;
+
+    // If we can't detect paid date, fall back to "now" but mark it (safer is to NOT enforce audit until it's correct)
+    const lastPaidAtIso = newestPaid && !Number.isNaN(newestPaid.getTime())
+      ? newestPaid.toISOString()
+      : null;
+
     await setExclusiveTierRole(interaction.member, interaction.guild, tier.role);
 
-    // Save email ↔ user after success
+    // ✅ Save email ↔ user after success + subscription audit fields
     emailMap[email] = {
       discordUserId: interaction.user.id,
       userTag: interaction.user.tag,
       tier: tier.role,
+
+      // 🔥 NEW fields (critical for audit)
+      isSubscription: matchedIsSubscription,
+      lastPaidAt: lastPaidAtIso, // null if shopify.js doesn't supply paidAt yet
+
       updatedAt: new Date().toISOString(),
     };
     saveEmailMap(emailMap);
@@ -490,6 +697,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       event: "verify_success",
       email,
       tier: tier.role,
+      isSubscription: matchedIsSubscription,
+      lastPaidAt: lastPaidAtIso,
       userId: interaction.user.id,
       guildId: interaction.guild?.id,
       at: new Date().toISOString(),
@@ -500,12 +709,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       userTag: interaction.user.tag,
       userId: interaction.user.id,
       grantedRole: tier.role,
-    }, "SUCCESS");
+      subscription: matchedIsSubscription,
+      lastPaidAt: lastPaidAtIso || "missing",
+      message: lastPaidAtIso ? "Saved lastPaidAt for audit ✅" : "⚠️ lastPaidAt missing (fix shopify.js to include paidAt)",
+    }, lastPaidAtIso ? "SUCCESS" : "WARN");
 
     return interaction.editReply(
       ui("Verification complete", [
         ok(`Access granted: ${fmtRole(tier.role)}`),
         bullet("If you upgraded, your lower tier role was removed automatically."),
+        matchedIsSubscription ? ok("Subscription detected ✅ (audit applies)") : warn("Not a subscription (audit will ignore you)"),
+        lastPaidAtIso ? ok(`Last paid recorded ✅`) : warn("Last paid missing ⚠️ (admin must patch shopify.js)"),
         hint("You can now access your channels."),
       ])
     );
