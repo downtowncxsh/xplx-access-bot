@@ -1,5 +1,18 @@
 require("dotenv").config();
 const { Client, GatewayIntentBits, Events, EmbedBuilder, MessageFlags } = require("discord.js");
+const express = require("express");
+
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get("/", (req, res) => {
+  res.send("XPLX Access Bot is running ✅");
+});
+
+app.listen(PORT, () => {
+  console.log(`🌐 Web server listening on port ${PORT}`);
+});
+
 const { getPaidLineItemsByEmail } = require("./shopify");
 const logger = require("./logger");
 const fs = require("fs");
